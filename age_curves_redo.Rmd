@@ -1,0 +1,534 @@
+---
+title: "WHKYE Age Curves"
+author: "Tyrel Stokes"
+date: "15/02/2022"
+output:
+  tufte::tufte_html: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE,message =FALSE,cache =TRUE)
+```
+
+I'm going to really quickly throw together some of my work on aging curves in INLA in case it is of use to anyone. Very quickly, the aging curve survival bias is a very interesting case. If players left our data set randomly, using the data we do have would not be an issue at all since we could very reasonalby use the observed cases to impute (at least at the aggregate level) for those unobserved. The problem is when there are systematic reasons why people exit which are related to the outcome.
+
+In causal inference, we break those systematic cases into 2. The first we call missing at random (don't get me started on nomenclature), which means that although the missing data is different than the observed, we can think of them as random conditioned on a few things we do observe. This is great news if we can justify it and what it means is that there should be some way to use the data we have to impute or average over in clever ways to get the kind of averages we want in the end.
+
+The other type is called not missing at random. This is when the systematic missingness also depends on stuff we don't observe. I.e the people leaving the league we are interested are different is some way that our data can't see. This is probably the case unfortunately in most sports we would expect players (or teams) to know something that our data doesn't about their chance of success and a bunch of million more dollars that we do not.
+
+But the best we can do is attack the problem as thought it is a missing at random problem but treat our answers with deep skepticism. 
+
+There are two main approaches that people do with this. The first, dating back to Tom Tango's work I believe (or this is the example I first learned about anyway I think. I looked for that piece and couldn't find it though??? If you have it send it and I will add it here) is the delta method (and used by [Evolving Wild](https://hockey-graphs.com/2017/03/23/a-new-look-at-aging-curves-for-nhl-skaters-part-1/) as well in hockey). The idea is that players shouldn't change too much from one season to the next, so if we compare all the 29 year olds that we actually observe to themselves as 28 year olds, the difference is interpreted as the effect of aging from 28 to 29. In years where there is not much drop out, we can't really get too much bias. The other is using a regression (in the spirit of [CJ Tuturo's work]( https://rpubs.com/cjtdevil/nhl_aging), also [Ben Howell's work](http://benhowell71.com/wp-content/uploads/2021/07/NWHL-Aging-Curves.html) in whockey with game score). We fit a fancy regression which allows us to pull together information across different ages (we can use exact ages even not just rounded ages) and the fitted mean function implicitly imputes the missing ages. (In causal inference we sometimes use these weighting approaches for these kinds of problems as well. To my knowledge no one has done this in sports for aging curves specifically. I have thought about it briefly but have never had the time to make it happen. If you are a causal minded person could be an interesting project, would be happy to work on this with someone if you have more time than I do also! Link to some related propensity work in hockey [here](https://rpubs.com/atoumi/zone-entries-nhl))
+
+Either way we approach this, we have to think really clearly about what the effect means. Since we have a selection bias effect the most, perhaps honest, interpretation of the effect from a causal effect is if we made you age 1 year and you are the kind of player that was likely going to play one more year anyway this is the effect of aging. 
+
+In many cases, this is the effect we want. When signing a player as a free agent, for many players there is no doubt that barring strange injury they will still be good enough to be in the league. But it doesn't tell us unconditionally what the effect of just aging one year is and again we can't really know that without making some clever assumptions about how those that continue to play relate to those that don't. This kind of effect would be really useful for long-term player evaluation and for players closer to the cut-off of league caliber.
+
+I know Micah has tweeted a few times about how surprisingly many players do have some juice left when they hang them up (also see his slides on aging [here](https://hockeyviz.com/static/pdf/ritsac19.pdf)). This might be a good sign, suggesting that some players are retiring not just because they expected to find themselves below replacement level gives us some hope the two populations are not so different after all.
+
+Something I have been thinking a lot about is how these selection effects are different in the women's game. Likely quite a lot. Given the salaries (which are not nearly enough and a far cry from the millions in the men's game), we would expect much more variance in terms of who leaves our data set and why. If we are lucky some of that extra variance might average out the quality of players leaving make it closer to random (note that as fans this would not be lucky at all - it means good players leave the game often. Only lucky for sick causal inference fiends that care for nothing but unbiased inference). But again we have to be careful when interpreting things. In this analysis, I am working with a data set cobbled together from [Their Hockey Counts](https://theirhockeycounts.com/) and the [WHKYE database](https://public.tableau.com/app/profile/john.bouchard7607/viz/WHKYeDashboard/Homepage). This is nice as it allows us to follow players around to different leagues, capturing some of the drop out we might see in other data sets or just using the NWHL/PHF stuff alone. 
+
+However, the curve is still best interpreted as representing the effect of aging for someone likely to find themselves back in that data set in the next small time step. 
+
+I got some interesting feedback on this work from the folks at the [Net Growth podcast](https://twitter.com/netgrowthpod). One of things they suggested I look at was the age curves of players receiving support and funding from the US and Canada national programs. What makes this subgroup interesting is that they should be much more resourced than most other folks in the women's hockey world. This subset helps us understand what the aging curve would look like for players that are getting relatively lots of support and that we expect to continue receiving that support. It might even offer a glimpse at what we might expect other subsets with more funding (but it is difficult to tease out the fact that these players are also very very talented).
+
+But remember depending on the question, this might not be the curve we want. If I am a GM in the PHF, this subset might only sometimes be the one I consult to make trades or contracts on (causal inference is annoying like that).
+
+Ok, enough of this. Here is some code. The data sets used can be accessed at the following [link](https://www.dropbox.com/sh/6yhj6e2hc7gzmd9/AACHSHjPrPuP9CDsZkR6V_gAa?dl=0). Let me know if that works for you. I encourage you to steal and play with as much of this code as you can.
+
+UPDATE: I have found the source of the weird plateau from 21-24ish. It turns out the way that I was sampling from the posterior predictive was innefficient. So 1 I wasn't taking enough samples and 2 - I still had a relatively large number of samples which made my data frames quite large. When you have large data frames, ggplot won't use loess for geom_smooth because it is computationally expensive. It seems these two things conspired to produce the effect. So if you are reading this now, much of the document was to investigate the plateau, but now there isn't a plateau. I am now going back to fix some of the writing up, there may be weird remains from the before.
+
+```{r,results = 'hide'}
+##################
+library(dplyr)
+### model with augmented data
+
+aug_whkye <- readr::read_csv("augmented_whkye.csv")
+
+aug_whkye$rounded_whkye <- round(aug_whkye$whkye*aug_whkye$GP,0)
+
+aug_whkye <- aug_whkye %>% filter(age >= 18)
+
+###
+
+## To include a player they need at least one season with more than some threshold of games
+
+names_aug <- unique(aug_whkye$Player)
+
+thres <- 15 # change this to whatever you think is reasonable!
+
+out <- vector(length = length(names_aug))
+
+for(i in 1:length(names_aug)){
+  
+ pind <- names_aug[i]
+ 
+ indp <- which(aug_whkye$Player == pind)
+ 
+ mini <- aug_whkye[indp,]
+ 
+ mingames <- max(mini$GP)
+ 
+ if(mingames >= thres){
+   
+   out[i] <- 1
+ }else{
+   out[i] <- 0
+ }
+  
+  
+}
+
+thres_names <- names_aug[out ==1] ## players that make the threshold cut
+
+
+aug_sub <- aug_whkye %>% filter(Player %in% thres_names) ## initially subsetted data
+```
+
+
+
+
+```{r}
+################################################
+
+## Make a new position column
+
+aug_sub$position <- ifelse(aug_sub$P =="F",1,ifelse(aug_sub$P =="D",2,3))
+
+seas <- unique(aug_sub$season)
+
+aug_sub$season_int <- plyr::mapvalues(aug_sub$season,from = seas, to = c(10:1))
+
+
+aug_sub$player_int <- plyr::mapvalues(aug_sub$Player,from= thres_names, to = c(1:length(thres_names)))
+```
+
+
+
+Now we can run our first INLA model. INLA stands for Integrated Nested Laplace Approximation and R-INLA is a really great package to help you do fast approximate bayesian inference. This is a [great book on it](https://becarioprecario.bitbucket.io/inla-gitbook/) if you want to lean more. I've talked about some of the cool spatial stuff you can do with it [here](https://statsbystokes.wordpress.com/2022/02/07/slides-sfu-sports-analytics-talk-about-epv-for-hockey/), but here we are using some of it's slightly simpler functionalities. Essentially we are going to be fitting a bayesian poisson regression with a fancy smoothing term for the aging. This is quite similar in effect to using splines or gams, but we are exploiting one of the neat functionalities in INLA. Essentially we are fitting a 1-dimensional SPDE on age (or approximation thereof). Just like splines we set some knots in age. At each knot we have a parameter, but then ages in between those knots are represented by weighted averages of the nearest knots. This gives us a continuous curve out which is fun. Again, this is not necessary and splines (also something we can do right in INLA) or other smoothing techniques (fitting a random walk on the knot parameters, something you can do in - you guessed it - INLA) would work just fine. I just wanted to try this out a bit more.
+
+```{r}
+library(INLA) # https://www.r-inla.org/download-install for install instructions
+
+# This sets the knots and makes the interpolation scheme for the age effect
+# feel free to play around with the knots!!!
+#knots <- c(18,19.5,21,22.5,24,26,28,30.5,32,max(aug_sub$age)) orginal knots
+kd <- 1.25
+knots <- seq(from = 18, to = max(aug_sub$age), by = kd)
+
+mesh1d <- inla.mesh.1d(knots) 
+
+## This is the projector matrix, which keeps track of the interpolation scheme which we can pass to 
+## INLA. Something that is cool is we can set different groups, the effects will borrow information from
+## each other, but ultimately have their own coefficients.
+## Here I fit three groups. Forwards, Defense, and other (people listed at several positions and so on)
+A1 <- inla.spde.make.A(mesh = mesh1d,loc= aug_sub$age, group = aug_sub$position, n.group =3)
+
+################
+inc <- .025
+xx <- seq(18,max(aug_sub$age), by = inc) ## These are the ages I will predict at
+
+xx2 <- c(xx,xx) # set the prediction values for both the forward group and defense group which 
+#I make predictions at after
+## This is the projector matrix for the predictions
+A.xx <- inla.spde.make.A(mesh = mesh1d,loc= xx2,
+                        group = c(rep(1,length(xx)),rep(2,length(xx))), n.group =3)
+
+## This sets the model for the spde effect. I use a special type of
+#prior which pulls us towards simpler models
+## I talk about these in my EPV talk I linked to earlier
+spde1 <- inla.spde2.pcmatern(mesh1d, constr = FALSE,prior.range = c(5,0.5),prior.sigma = c(1, 0.5))
+spde1.idx <- inla.spde.make.index("w", n.spde = spde1$n.spde, n.group = 3)
+
+```
+
+Now that we have set the important parts of the model and set up the spde age effect, we can build the data stacks for the model and predictions. The reason we also add in the predicitons is that from a bayesian perspective we can think of predictions as a missing data problem and it's not fundamentally different than fitting the data. This is not the only way to get predicitons in INLA, but in this case it is probably the easiest way.
+```{r}
+
+## This cobbles together all the predictors for the model and 
+#the values of the predictions we want after the fact
+
+stack <- inla.stack(data = list(y = aug_sub$rounded_whkye),
+                    A = list(1,1,1,1,1 ,1,1,A1),
+                    effects = list(intercept = rep(1,nrow(aug_sub)),
+                                   season = aug_sub$season_int,
+                                   games = aug_sub$GP,
+                                   player = aug_sub$player_int,
+                                   position = aug_sub$position,
+                                   age_std = (aug_sub$age- mean(aug_sub$age))/sd(aug_sub$age),
+                                   league = aug_sub$league,
+                                   spde1.idx)
+)
+
+
+stack.pred <- inla.stack(data = list(y = NA),
+                         A = list(1,1,1,1,1,1,1,A.xx),
+                         effects = list(intercept = rep(1,length(xx2)),
+                                        season = rep(NA,length(xx2)),
+                                        player =  rep(NA,length(xx2)),
+                                        games = rep(30,length(xx2)),
+                                        position = c(rep(1,length(xx)),rep(2,length(xx))),
+                                        age_std = (xx2 - mean(aug_sub$age))/sd(aug_sub$age),
+                                        league = rep(NA,length(xx2)),
+                                        
+                                        spde1.idx))
+
+####################
+## put the data and intended predictions together
+##
+joint.stack = inla.stack(stack,stack.pred)
+
+```
+
+Now we can fit the model. I fit a few other fixed and random effects. The random effect for player is important for controlling for the unobserved individual player effects. This allows us to more reasonably compare the model with a delta method counter-part. This model shares more information, the price of which is a few added structural assumptions on how to share that information.
+```{r}
+f2 <- as.formula("y ~ -1+intercept +games+ f(season, model = 'iid',
+hyper = list(theta = list(prior = 'pc.prec', param = c(2, 0.5))))+
+                 f(player, model = 'iid', hyper = list(theta = list(prior = 
+'pc.prec', param = c(0.5, 0.5))))+ as.factor(position)+f(w, model = spde1,
+control.group = list(model = 'exchangeable'))")
+
+
+
+inla_mod <- inla(f2, data = inla.stack.data(joint.stack),
+                 family = "poisson",
+                 control.compute =list(waic = TRUE,dic = TRUE,
+                      config = TRUE,return.marginals.predictor=TRUE),
+                 control.fixed = list(prec = .5),
+                 control.predictor=list(A=inla.stack.A(joint.stack),
+                  compute=TRUE, link = 1),verbose =FALSE)
+
+
+
+```
+
+This is a reasonably complicated model and it takes about 7 seconds to fit on my machine. That's the magic of INLA, at this scale it's not practical much different than fitting the frequentist version. Of course it is an order of magnitude slower, but in this kind of a work flow the difference is minimal (of course the tradeoff changes as things scale) which is really impression for a full bayesian model with rich predictions.
+
+
+```{r}
+summary(inla_mod)
+```
+
+This gives us our summary, much of which should look familiar. I also calculated some model fit criterion like WAIC which we could use to compare competing models for example.
+
+Now I want to get predictions posterior predictive. As a quick check to make sure things are working let's get som samples from a really good season from Amanda Kessel.
+
+
+
+
+```{r}
+library(ggplot2)
+i <- 547
+
+all_marg1 <- inla_mod$marginals.fitted.values[i]
+
+
+  r.sampling <- inla.rmarginal(8000, all_marg1[[1]]) 
+  
+  amanda_dt <- data.frame(points = r.sampling)
+  
+  amanda_dt %>% ggplot(aes(points))+geom_histogram()+
+    geom_vline(xintercept = aug_sub$rounded_whkye[i])
+
+
+```
+
+Even though this was an incredible year, the model seems to expect more points than she got (vertical line).
+
+Now we will pull out our predictions at the points per game level fro forwards and defense separately. 
+
+Note: The above was the previous way I was sampling the posterior predictive. Notice that I had to take 8000 samples. Play with that number yourself. Even at 1000 it is quite off. This was essentially the mistake that lead to the weird curves before.
+
+
+```{r}
+library(foreach)
+
+indexes <- (nrow(aug_sub)+1):(nrow(aug_sub)+length(xx))
+
+all_marg_1 <- inla_mod$marginals.fitted.values[indexes]
+
+n_samp <- 1 # Right now using the emarginal instead of samples,so set to 1
+
+forward_dt <- foreach(i =1:length(all_marg_1), .combine = rbind)%do%{
+  preds <- all_marg_1[[i]]
+  r.sampling <- inla.rmarginal(n_samp, preds) 
+# This draws a sample from the posterior at our predictions
+  sampling <- rpois(n_samp,r.sampling)/30 
+  # This generates data from the posterior predictive. We divide
+  # by 30 because I set all the predicitons to be for 30 games. This 
+  # gives us a pts/game posterior predictive
+  
+  avg <- inla.emarginal(function(x){x},preds) 
+# This calculates the expected points per 30 games at prediction inputs
+  e2 <- inla.emarginal(function(x){x^2},preds) 
+  
+  
+  std1 <- sqrt(e2 - avg^2) ## standard deviation at 30 games
+  std2 <- sd(sampling) ## standard deviation of posterior predictive
+  
+  data.frame(points = sampling, age = xx[i], position = "Forward", avg = avg, std = std1, std2 = std2)
+  
+}
+
+```
+
+
+
+```{r}
+## Same as above but for the defense
+indexes <- (nrow(aug_sub)+length(xx)+1):(nrow(aug_sub)+length(xx2))
+all_marg_2 <- inla_mod$marginals.fitted.values[indexes]
+
+defense_dt <- foreach(i =1:length(all_marg_2), .combine = rbind)%do%{
+  preds <- all_marg_2[[i]]
+  
+  r.sampling <- inla.rmarginal(n_samp, preds)
+  sampling <- rpois(n_samp,r.sampling)/30
+  
+  data.frame(points = sampling, age = xx[i], position = "Defense")
+  
+  avg <- inla.emarginal(mean,preds)
+  std1 <- inla.emarginal(sd,preds)
+  
+  std2 <- sd(sampling)
+  
+  data.frame(points = sampling, age = xx[i], position = "Defense", avg = avg, std = std1, std2 = std2)
+  
+  
+}
+
+```
+
+
+
+Now plot those posterior predictive means
+
+```{r}
+library(ggplot2)
+forward_dt %>% group_by(age,position,avg,std)
+
+
+fp <- ggplot(forward_dt,aes(x=age,y=avg/30)) + geom_smooth() + ylab("Posterior Predicted Points")+
+  ggtitle("Forward Primary Predicted whkye/gm average over seasons")
+
+
+fp
+
+```
+
+
+
+```{r}
+
+dp <- ggplot(defense_dt,aes(x=age,y = avg/30)) + geom_smooth()+
+  ylab("Posterior Predicted Points")+
+  ggtitle("Defense Primary Predicted whkye/gm averaged over seasons")
+
+dp
+```
+
+Okay now we will attempt to subset on the players affiliated with team canada only
+
+```{r}
+canusa <- readxl::read_excel("can_usa_rosters.xlsx")
+
+aug_sub <- aug_sub %>% mutate(canusa = ifelse(Player %in% canusa$Player,1,0))
+
+canusa_dt <- aug_sub %>% filter(canusa ==1)
+```
+
+
+
+We get 157 player seasons it seems. There are two ways to do this. Estimate the model all on it's own. Or make new player categories that interact with the can-usa status. The latter let's us share more information. Both seem reasonable. I am going to try the latter but feel free to adapt this and try out the former.
+
+
+```{r}
+aug_sub$position_2 <- ifelse(aug_sub$canusa == 0,aug_sub$position,ifelse(aug_sub$position ==1,4,5 ))
+table(aug_sub$position_2)
+```
+
+
+Now I can recopy most of the old code and make a few changes, see what we get. Are there better and cleaner ways? Yes. I'm trying to go to bed though.
+
+
+```{r}
+# This sets the knots and makes the interpolation scheme for the age effect
+# feel free to play around with the knots!!!
+mesh1d <- inla.mesh.1d(knots) 
+
+## This is the projector matrix, which keeps track of the interpolation scheme which we can pass to 
+## INLA. Something that is cool is we can set different groups, the effects will borrow information from
+## each other, but ultimately have their own coefficients.
+## Here I fit three groups. Forwards, Defense, and other (people listed at several positions and so on)
+A1 <- inla.spde.make.A(mesh = mesh1d,loc= aug_sub$age, group = aug_sub$position_2, n.group =5)
+
+################
+xx <- seq(18,max(aug_sub$age), by = inc) ## These are the ages I will predict at
+
+xx2 <- c(xx,xx) # set the prediction values for both the forward group and 
+#defense group which I make predictions at after
+## This is the projector matrix for the predictions
+A.xx <- inla.spde.make.A(mesh = mesh1d,loc= xx2, 
+                group = c(rep(1,length(xx)),rep(2,length(xx))), n.group =5)
+
+## This sets the model for the spde effect. I use a special type of 
+#prior which pulls us towards simpler models
+## I talk about these in my EPV talk I linked to earlier
+spde1 <- inla.spde2.pcmatern(mesh1d, constr = FALSE,
+                      prior.range = c(5,0.5),prior.sigma = c(1, 0.5))
+spde1.idx <- inla.spde.make.index("w", n.spde = spde1$n.spde, n.group = 5)
+
+stack <- inla.stack(data = list(y = aug_sub$rounded_whkye),
+                    A = list(1,1,1,1,1 ,1,1,A1),
+                    effects = list(intercept = rep(1,nrow(aug_sub)),
+                                   season = aug_sub$season_int,
+                                   games = aug_sub$GP,
+                                   player = aug_sub$player_int,
+                                   position = aug_sub$position_2,
+                                   age_std = (aug_sub$age- mean(aug_sub$age))/sd(aug_sub$age),
+                                   league = aug_sub$league,
+                                   spde1.idx)
+)
+
+
+stack.pred <- inla.stack(data = list(y = NA),
+                         A = list(1,1,1,1,1,1,1,A.xx),
+                         effects = list(intercept = rep(1,length(xx2)),
+                                        season = rep(NA,length(xx2)),
+                                        player =  rep(NA,length(xx2)),
+                                        games = rep(30,length(xx2)),
+                                        position = c(rep(4,length(xx)),rep(5,length(xx))),
+                                        age_std = (xx2 - mean(aug_sub$age))/sd(aug_sub$age),
+                                        league = rep(NA,length(xx2)),
+                                        
+                                        spde1.idx))
+
+####################
+## put the data and intended predictions together
+##
+joint.stack = inla.stack(stack,stack.pred)
+
+f2 <- as.formula("y ~ -1+intercept +games+ f(season, model = 'iid',
+hyper = list(theta = list(prior = 'pc.prec', param = c(2, 0.5))))+
+                 f(player, model = 'iid', hyper = 
+list(theta = list(prior = 'pc.prec', param = c(0.5, 0.5))))+
+as.factor(position)+f(w, model = spde1, control.group = list(model = 'exchangeable'))")
+
+
+inla_mod2 <- inla(f2, data = inla.stack.data(joint.stack),
+                family = "poisson",
+                 control.compute =list(waic = TRUE,
+                dic = TRUE, config = TRUE,return.marginals.predictor=TRUE),
+                 control.fixed = list(prec = .5),
+                 control.predictor=list(A=inla.stack.A(joint.stack),
+                                  compute=TRUE, link = 1),verbose =FALSE)
+
+
+indexes1 <- (nrow(aug_sub)+1):(nrow(aug_sub)+length(xx))
+all_marg_1 <- inla_mod2$marginals.fitted.values[indexes1]
+
+n_samp <- 1
+
+forward_dt_olympic <- foreach(i =1:length(all_marg_1), .combine = rbind)%do%{
+  preds <- all_marg_1[[i]]
+  r.sampling <- inla.rmarginal(n_samp, preds) 
+# This draws a sample from the posterior at our predictions
+  sampling <- rpois(n_samp,r.sampling)/30 
+  # This generates data from the posterior predictive. We divide
+  # by 30 because I set all the predicitons to be for 30 games. This 
+  # gives us a pts/game posterior predictive
+  
+  avg <- inla.emarginal(function(x){x},preds) 
+# This calculates the expected points per 30 games at prediction inputs
+  e2 <- inla.emarginal(function(x){x^2},preds) 
+  
+  
+  std1 <- sqrt(e2 - avg^2) ## standard deviation at 30 games
+  std2 <- sd(sampling) ## standard deviation of posterior predictive
+  
+  data.frame(points = sampling, age = xx[i],
+          position = "Forward", avg = avg, std = std1, std2 = std2)
+  
+}
+
+indexes2 <- (nrow(aug_sub)+length(xx)+1):(nrow(aug_sub)+length(xx2))
+all_marg_2 <- inla_mod2$marginals.fitted.values[indexes2]
+
+defense_dt_olympic <- foreach(i =1:length(all_marg_2), .combine = rbind)%do%{
+  preds <- all_marg_2[[i]]
+  
+  r.sampling <- inla.rmarginal(n_samp, preds)
+  sampling <- rpois(n_samp,r.sampling)/30
+  
+  data.frame(points = sampling, age = xx[i], position = "Defense")
+  
+  avg <- inla.emarginal(mean,preds)
+  std1 <- inla.emarginal(sd,preds)
+  
+  std2 <- sd(sampling)
+  
+  data.frame(points = sampling, age = xx[i], position = "Defense",
+             avg = avg, std = std1, std2 = std2)
+  
+  
+}
+
+
+
+fp2 <- ggplot(forward_dt_olympic,aes(x=age,y = avg/30)) + geom_smooth() +
+  ylab("Posterior Predicted Points")+
+  ggtitle("CAN-USA Forward Primary Predicted whkye/gm average over seasons")
+
+
+fp2
+
+dp2 <- ggplot(defense_dt_olympic,aes(x=age,y = avg/30)) + geom_smooth()+
+  ylab("Posterior Predicted Points")+
+  ggtitle("CAN-USA Defense Primary Predicted whkye/gm averaged over seasons")
+
+dp2
+
+```
+
+
+
+```{r}
+
+forward_dt$type = "Full Data"
+defense_dt$type = "Full Data"
+
+forward_dt_olympic$type = "CAN-USA"
+defense_dt_olympic$type = "CAN-USA"
+
+dt_comb <- rbind(forward_dt,defense_dt,forward_dt_olympic,defense_dt_olympic)
+
+dt_comb <- dt_comb %>% mutate(type2 = paste(position,type))
+
+dt_comb %>% ggplot(aes(x=age,y = avg/30)) + geom_smooth(aes(color = type2))+ ylab("Posterior Predicted Points")+
+  ggtitle("CAN-USA Defense Primary Predicted whkye/gm averaged over seasons")
+```
+
+
+Originally when I did this the bump didn't do away so I made more modifications to the model to make it share less information. Spoiler alert, it changed very little. I decided to delete all that code in the end because it was mostly redundant.
+
+It is pretty wild though that the CAN-USA defensemen are out there scoring like that, very rude. They score at a higher pace than the overall average for forwards (which includes the CAN-USA forwards). Pretty wild if you ask me. Anyway, those curves look pretty reasonable to me.
+
+Somethng that I see is that the CAN-USA curves look most like what we expect. This is likely one of the selection effects. The players on the national teams we might expect to leave once they decline. Perhaps in general only the most talented players continue to play past a certain age. Again none of these curves are necessarily wrong depending on the question that we are asking. I'd love to hear what other people think, how you make sense of them!
+
+Another thing that I forgot to mention in the beginning is that this is also just an aging curve for points. There are certainly other outcomes that one might want to look and we should take the outcome into account when thinking about what these curves mean.
+
+
+## Additional Graph
+
+Did a little more investigating about the plateau and then lack thereof. Here is a plot of the raw posterior predictive means without any smoothing algorithms on top of them.
+
+```{r}
+dt_comb %>% ggplot(aes(x=age,y = avg/30)) + geom_point(aes(color = type2))+ ylab("Posterior Predicted Points")+
+  ggtitle("CAN-USA + Full Data Primary Predicted whkye/gm averaged over seasons")
+```
+
+
+There does seem to be a bit of a plateau. The raw outputs suggest a sharp increase, a small plateau and then another sharp increase for CAN-USA forwards, all data forwards and CAN-USA defense. There still could be something with college and after college, perhaps an adjustment. But it could also be reading way too much into noise. 
+
+Something I think about with these curves is that something like points is a product of physical skills and mental skills. There could be somthing to be said about how these interact to produce this dip. Another suspect would be playing time. The data set I have doesn't have ice time numbers, so possibly after leaving college the players are being used enough - there is a lag between their actual ability and their coaches assessment of their ability. Or perhaps they have other deficiencies which are correctly being penalized by lower ice time not so sure.
+
